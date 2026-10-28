@@ -156,18 +156,29 @@ final class GlobalShortcut {
     deinit { pause(); if let handler = handler { RemoveEventHandler(handler) } }
 }
 
-final class ShortcutSettings: NSObject, NSWindowDelegate {
+final class SettingsRows: NSStackView { override var isFlipped: Bool { true } }
+
+final class AppSettings: NSObject, NSWindowDelegate {
     let shortcut: GlobalShortcut
     let window: NSWindow
     let record = NSButton()
     let message = NSTextField(wrappingLabelWithString: "点击下方按钮，然后按下想使用的组合键。")
     var monitor: Any?
+    var dataURL: URL!
+    var saveOptions: ((Set<String>, Bool, Bool, Int, Int) -> String?)?
+    let daily = NSButton(checkboxWithTitle: "每天自动刷新", target: nil, action: nil)
+    let login = NSButton(checkboxWithTitle: "登录时启动", target: nil, action: nil)
+    let hour = NSTextField()
+    let minute = NSTextField()
+    let shareRows = SettingsRows()
+    var shareButtons = [NSButton]()
+    var startingDisabled = Set<String>()
     var changed: (() -> Void)?
     init(shortcut: GlobalShortcut) {
         self.shortcut = shortcut
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 245), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 690), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         super.init()
-        window.title = "everything · 快捷键设置"
+        window.title = "everything · 设置"
         window.isReleasedWhenClosed = false
         window.delegate = self
         let title = NSTextField(labelWithString: "全局唤出快捷键")
@@ -189,9 +200,74 @@ final class ShortcutSettings: NSObject, NSWindowDelegate {
             reset.leadingAnchor.constraint(equalTo: record.trailingAnchor, constant: 16), reset.centerYAnchor.constraint(equalTo: record.centerYAnchor),
             message.leadingAnchor.constraint(equalTo: title.leadingAnchor), message.trailingAnchor.constraint(equalTo: help.trailingAnchor), message.topAnchor.constraint(equalTo: record.bottomAnchor, constant: 15)
         ])
+        let autoLabel = NSTextField(labelWithString: "自动刷新与启动")
+        autoLabel.font = .boldSystemFont(ofSize: 16)
+        let colon = NSTextField(labelWithString: ":")
+        let shareLabel = NSTextField(labelWithString: "参与搜索的共享盘")
+        shareLabel.font = .boldSystemFont(ofSize: 16)
+        let shareHelp = NSTextField(wrappingLabelWithString: "按实际盘名勾选。个人文件夹始终参与搜索；新连接的共享盘默认启用。")
+        shareHelp.textColor = .secondaryLabelColor
+        let shareScroll = NSScrollView()
+        shareScroll.hasVerticalScroller = true; shareScroll.borderType = .bezelBorder
+        shareRows.orientation = .vertical; shareRows.alignment = .leading; shareRows.spacing = 10
+        shareScroll.documentView = shareRows
+        shareRows.translatesAutoresizingMaskIntoConstraints = false
+        let reload = NSButton(title: "重新检测共享盘", target: self, action: #selector(reloadShares))
+        let save = NSButton(title: "保存设置", target: self, action: #selector(saveSettings))
+        for item in [autoLabel, daily, hour, colon, minute, login, shareLabel, shareHelp, shareScroll, reload, save] {
+            item.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(item)
+        }
+        NSLayoutConstraint.activate([
+            autoLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 250), autoLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            daily.topAnchor.constraint(equalTo: autoLabel.bottomAnchor, constant: 14), daily.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            hour.leadingAnchor.constraint(equalTo: daily.trailingAnchor, constant: 16), hour.centerYAnchor.constraint(equalTo: daily.centerYAnchor), hour.widthAnchor.constraint(equalToConstant: 40),
+            colon.leadingAnchor.constraint(equalTo: hour.trailingAnchor, constant: 5), colon.centerYAnchor.constraint(equalTo: daily.centerYAnchor),
+            minute.leadingAnchor.constraint(equalTo: colon.trailingAnchor, constant: 5), minute.centerYAnchor.constraint(equalTo: daily.centerYAnchor), minute.widthAnchor.constraint(equalToConstant: 40),
+            login.topAnchor.constraint(equalTo: daily.bottomAnchor, constant: 12), login.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            shareLabel.topAnchor.constraint(equalTo: login.bottomAnchor, constant: 26), shareLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            shareHelp.topAnchor.constraint(equalTo: shareLabel.bottomAnchor, constant: 8), shareHelp.leadingAnchor.constraint(equalTo: title.leadingAnchor), shareHelp.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            shareScroll.topAnchor.constraint(equalTo: shareHelp.bottomAnchor, constant: 12), shareScroll.leadingAnchor.constraint(equalTo: title.leadingAnchor), shareScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24), shareScroll.bottomAnchor.constraint(equalTo: save.topAnchor, constant: -16),
+            shareRows.leadingAnchor.constraint(equalTo: shareScroll.contentView.leadingAnchor, constant: 10), shareRows.topAnchor.constraint(equalTo: shareScroll.contentView.topAnchor, constant: 10), shareRows.widthAnchor.constraint(equalTo: shareScroll.widthAnchor, constant: -35),
+            save.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24), save.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20),
+            reload.leadingAnchor.constraint(equalTo: title.leadingAnchor), reload.centerYAnchor.constraint(equalTo: save.centerYAnchor)
+        ])
         window.center()
     }
+    @objc func reloadShares() {
+        var disabled = startingDisabled
+        for button in shareButtons { if let id = button.identifier?.rawValue { if button.state == .on { disabled.remove(id) } else { disabled.insert(id) } } }
+        shareButtons.removeAll()
+        for view in shareRows.arrangedSubviews { shareRows.removeArrangedSubview(view); view.removeFromSuperview() }
+        let shares = SharedSources.known(in: dataURL)
+        if shares.isEmpty { shareRows.addArrangedSubview(NSTextField(wrappingLabelWithString: "尚未发现共享盘，请先在 Finder 中连接，再点重新检测。")) }
+        for share in shares {
+            let row = NSButton(checkboxWithTitle: share.name + (share.connected ? "（已连接）" : "（未连接，保留索引）"), target: nil, action: nil)
+            row.identifier = NSUserInterfaceItemIdentifier(share.id)
+            row.toolTip = share.root
+            row.state = disabled.contains(share.id) ? .off : .on
+            shareRows.addArrangedSubview(row); shareButtons.append(row)
+        }
+    }
+    @objc func saveSettings() {
+        guard let h = Int(hour.stringValue), (0...23).contains(h), let m = Int(minute.stringValue), (0...59).contains(m) else {
+            message.textColor = .systemRed; message.stringValue = "请输入有效时间：小时 0–23，分钟 0–59。"; return
+        }
+        var disabled = startingDisabled
+        for button in shareButtons { if let id = button.identifier?.rawValue { if button.state == .on { disabled.remove(id) } else { disabled.insert(id) } } }
+        if let error = saveOptions?(disabled, daily.state == .on, login.state == .on, h, m) {
+            message.textColor = .systemRed; message.stringValue = error
+        } else {
+            startingDisabled = disabled; message.textColor = .secondaryLabelColor; message.stringValue = "已保存，搜索范围立即生效。快捷键修改后会自动保存。"
+        }
+    }
     func show() {
+        let defaults = UserDefaults.standard
+        daily.state = defaults.bool(forKey: "autoRefresh") ? .on : .off
+        login.state = defaults.bool(forKey: "startAtLogin") ? .on : .off
+        hour.stringValue = String(format: "%02d", defaults.integer(forKey: "refreshHour"))
+        minute.stringValue = String(format: "%02d", defaults.integer(forKey: "refreshMinute"))
+        startingDisabled = SharedSources.readDisabled(in: dataURL)
+        shareButtons.removeAll(); reloadShares()
         record.title = shortcut.label
         if shortcut.active == nil { message.stringValue = "当前快捷键未能注册，请设置其他组合键。"; message.textColor = .systemRed }
         NSApp.setActivationPolicy(.regular)
@@ -315,7 +391,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     var timer: Timer?
     var process: Process?
     var shortcut: GlobalShortcut?
-    var shortcutSettings: ShortcutSettings?
+    var shortcutSettings: AppSettings?
     var statusItem: NSStatusItem?
     var instanceLock: Int32 = -1
     var showObserver: NSObjectProtocol?
@@ -354,10 +430,8 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let appItem = NSMenuItem()
         let appMenu = NSMenu(title: "everything")
         appMenu.addItem(withTitle: "打开搜索", action: #selector(showSearch), keyEquivalent: "")
-        let settingsItem = appMenu.addItem(withTitle: "设置快捷键…", action: #selector(showShortcutSettings), keyEquivalent: ",")
+        let settingsItem = appMenu.addItem(withTitle: "设置…", action: #selector(showAppSettings), keyEquivalent: ",")
         settingsItem.target = self
-        let scheduleItem = appMenu.addItem(withTitle: "自动刷新设置…", action: #selector(showScheduleSettings), keyEquivalent: "")
-        scheduleItem.target = self
         appMenu.addItem(withTitle: "隐藏everything", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出everything", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -508,7 +582,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             let previous = try? Data(contentsOf: file)
             if enabled, let previous = previous,
                let prior = try? PropertyListSerialization.propertyList(from: previous, options: [], format: nil) as? NSDictionary,
-               prior.isEqual(to: content) { continue }
+               prior.isEqual(to: content), launchctl(["print", "gui/\(getuid())/\(label)"]) { continue }
             if previous != nil { _ = launchctl(["bootout", "gui/\(getuid())", file.path]); try? FileManager.default.removeItem(at: file) }
             if enabled {
                 do {
@@ -518,24 +592,6 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             }
         }
         return success
-    }
-    @objc func showScheduleSettings() {
-        let defaults = UserDefaults.standard
-        let alert = NSAlert(); alert.messageText = "自动刷新设置"; alert.informativeText = "共享盘离线时保留上次索引。使用 Mac 当前时区。"
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 90))
-        let daily = NSButton(checkboxWithTitle: "每天自动刷新", target: nil, action: nil); daily.frame = NSRect(x: 0, y: 62, width: 150, height: 24); daily.state = defaults.bool(forKey: "autoRefresh") ? .on : .off
-        let hour = NSTextField(string: String(format: "%02d", defaults.integer(forKey: "refreshHour"))); hour.frame = NSRect(x: 155, y: 62, width: 35, height: 24)
-        let colon = NSTextField(labelWithString: ":"); colon.frame = NSRect(x: 194, y: 62, width: 10, height: 24)
-        let minute = NSTextField(string: String(format: "%02d", defaults.integer(forKey: "refreshMinute"))); minute.frame = NSRect(x: 207, y: 62, width: 35, height: 24)
-        let login = NSButton(checkboxWithTitle: "登录时启动并在菜单栏常驻", target: nil, action: nil); login.frame = NSRect(x: 0, y: 22, width: 300, height: 24); login.state = defaults.bool(forKey: "startAtLogin") ? .on : .off
-        [daily, hour, colon, minute, login].forEach { box.addSubview($0) }; alert.accessoryView = box
-        alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        guard let h = Int(hour.stringValue), (0...23).contains(h), let m = Int(minute.stringValue), (0...59).contains(m) else {
-            let invalid = NSAlert(); invalid.messageText = "请输入有效时间"; invalid.informativeText = "小时为 0–23，分钟为 0–59。"; invalid.runModal(); return
-        }
-        defaults.set(daily.state == .on, forKey: "autoRefresh"); defaults.set(login.state == .on, forKey: "startAtLogin"); defaults.set(h, forKey: "refreshHour"); defaults.set(m, forKey: "refreshMinute")
-        if !configureAgents() { let failure = NSAlert(); failure.messageText = "无法启用自动任务"; failure.informativeText = "请检查登录项权限，也可以手动刷新索引。"; failure.runModal() }
     }
     func installBackgroundControls() {
         let shortcut = GlobalShortcut()
@@ -553,20 +609,32 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let show = NSMenuItem(title: "打开 everything", action: #selector(showSearch), keyEquivalent: "")
         show.target = self
         menu.addItem(show)
-        let settings = NSMenuItem(title: "设置快捷键…", action: #selector(showShortcutSettings), keyEquivalent: "")
+        let settings = NSMenuItem(title: "设置…", action: #selector(showAppSettings), keyEquivalent: "")
         settings.target = self
         menu.addItem(settings)
-        let schedule = NSMenuItem(title: "自动刷新设置…", action: #selector(showScheduleSettings), keyEquivalent: "")
-        schedule.target = self
-        menu.addItem(schedule)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出 everything", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
         statusItem?.menu = menu
     }
-    @objc func showShortcutSettings() {
+    @objc func showAppSettings() {
         guard let shortcut = shortcut else { return }
         if shortcutSettings == nil {
-            shortcutSettings = ShortcutSettings(shortcut: shortcut)
+            shortcutSettings = AppSettings(shortcut: shortcut)
+            shortcutSettings?.dataURL = data
+            shortcutSettings?.saveOptions = { [weak self] disabled, daily, login, hour, minute in
+                guard let self = self else { return "设置窗口已失效，请重新打开。" }
+                let changed = SharedSources.readDisabled(in: self.data) != disabled
+                do { try SharedSources.saveDisabled(disabled, in: self.data) } catch { return "共享盘选择保存失败：" + error.localizedDescription }
+                let defaults = UserDefaults.standard
+                defaults.set(daily, forKey: "autoRefresh"); defaults.set(login, forKey: "startAtLogin")
+                defaults.set(hour, forKey: "refreshHour"); defaults.set(minute, forKey: "refreshMinute")
+                self.lastKey = ""; self.poll()
+                #if !TESTING_UI
+                if !self.configureAgents() { return "设置已保存，但自动任务启用失败，请检查登录项权限。" }
+                if changed { self.refreshIndex() }
+                #endif
+                return nil
+            }
             shortcutSettings?.changed = { [weak self] in
                 guard let self = self else { return }
                 self.statusItem?.button?.toolTip = "everything · " + (self.shortcut?.label ?? "")
@@ -754,18 +822,22 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             var result: [String: Any]?
             if let raw = try? Data(contentsOf: url) { result = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] }
             let obj = result
-            let list = obj?["paths"] as? [String] ?? []
+            let allPaths = obj?["paths"] as? [String] ?? []
             let attributes = obj?["metadata"] as? [String: [String: Any]] ?? [:]
             let sources = obj?["sources"] as? [[String: Any]] ?? []
             var sourceMap = [String: String]()
-            for source in sources {
+            let disabled = SharedSources.readDisabled(in: self.data)
+            var allowed = Set<String>()
+            for source in sources where !disabled.contains(source["id"] as? String ?? "") {
                 let name = source["name"] as? String ?? "本地"
-                for path in source["paths"] as? [String] ?? [] { sourceMap[path] = name }
+                for path in source["paths"] as? [String] ?? [] { sourceMap[path] = name; allowed.insert(path) }
             }
+            let list = allPaths.filter { allowed.contains($0) }
             let prepared = list.map { SearchEntry(path: $0, metadata: attributes[$0] ?? [:], source: sourceMap[$0] ?? "本地") }
             DispatchQueue.main.async {
                 self.loading = false
-                if let obj = obj, let list = obj["paths"] as? [String] {
+                guard disabled == SharedSources.readDisabled(in: self.data) else { self.lastKey = ""; self.poll(); return }
+                if let obj = obj {
                     self.paths = list
                     self.entries = prepared
                     self.metadata = attributes

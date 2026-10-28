@@ -21,27 +21,14 @@ func read(_ name: String) -> [String: Any] {
           let object = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { return [:] }
     return object
 }
-func cstring<T>(_ value: T) -> String {
-    var v = value
-    return withUnsafePointer(to: &v) { ptr in ptr.withMemoryRebound(to: CChar.self, capacity: MemoryLayout<T>.size) { String(cString: $0) } }
-}
+func cstring<T>(_ value: T) -> String { SharedSources.cstring(value) }
 func smbMounts() -> [(String, String)] {
     #if TESTING
     let raw = ProcessInfo.processInfo.environment["EVERYTHING_TEST_MOUNTS"] ?? "[]"
     let entries = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [[String]] ?? []
     return entries.compactMap { $0.count == 2 ? ($0[0], $0[1]) : nil }
     #else
-    var mounts: UnsafeMutablePointer<statfs>?
-    let n = getmntinfo(&mounts, MNT_NOWAIT)
-    guard n > 0, let mounts = mounts else { return [] }
-    return (0..<Int(n)).compactMap { i in
-        let s = mounts[i]
-        guard cstring(s.f_fstypename) == "smbfs" else { return nil }
-        let path = cstring(s.f_mntonname)
-        let origin = cstring(s.f_mntfromname)
-        let digest = SHA256.hash(data: Data(origin.utf8)).map { String(format: "%02x", $0) }.joined()
-        return (path, digest)
-    }
+    return SharedSources.mounted().map { ($0.root, $0.id) }
     #endif
 }
 let started = Date()
@@ -51,6 +38,7 @@ func status(_ state: String, _ message: String, _ count: Int = 0) {
 let oldIndex = read("index.json")
 let oldSources = oldIndex["sources"] as? [[String: Any]] ?? []
 let mounted = smbMounts()
+let disabled = SharedSources.readDisabled(in: data)
 #if TESTING
 let home = ProcessInfo.processInfo.environment["EVERYTHING_TEST_HOME"]!
 #else
@@ -86,7 +74,7 @@ for (position, source) in sources.enumerated() {
     let old = oldSources.first { ($0["id"] as? String) == id && ($0["root"] as? String) == root } ?? ["name":name,"root":root,"id":id,"paths":[String](),"metadata":[:]]
     status("running", "正在刷新 \(name)；已有索引仍可搜索。")
     var paths = [String](), metadata = [String:Any](), errors = [[String:String]](), pending = [root]
-    var failure: String? = source["offline"] as? Bool == true ? "未连接，保留上次索引" : nil
+    var failure: String? = disabled.contains(id) ? "已停用，保留缓存" : (source["offline"] as? Bool == true ? "未连接，保留上次索引" : nil)
     var last = Date.distantPast
     while failure == nil && !pending.isEmpty {
         if Date().timeIntervalSince(sourceStarted) > 2700 { failure = "扫描超时，保留上次索引"; break }
@@ -119,7 +107,7 @@ for (position, source) in sources.enumerated() {
     allErrors.append(contentsOf: errors)
     var result: [String:Any]
     if let failure = failure {
-        result = old; result["warning"] = failure; warnings.append("\(name)：\(failure)")
+        result = old; result["warning"] = failure; if !disabled.contains(id) { warnings.append("\(name)：\(failure)") }
     } else {
         if !errors.isEmpty {
             let previous = old["paths"] as? [String] ?? []
@@ -139,5 +127,5 @@ for (position, source) in sources.enumerated() {
     try publish(results + pendingOld)
 }
 try save("errors.json", allErrors)
-let counts = results.map { "\($0["name"] ?? "") \(($0["paths"] as? [String] ?? []).count) 项" }.joined(separator:" · ")
+let counts = results.filter { !disabled.contains($0["id"] as? String ?? "") }.map { "\($0["name"] ?? "") \(($0["paths"] as? [String] ?? []).count) 项" }.joined(separator:" · ")
 status(warnings.isEmpty ? "ready" : "warning", counts + (warnings.isEmpty ? "" : " · " + warnings.joined(separator:"；")))

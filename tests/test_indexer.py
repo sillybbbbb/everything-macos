@@ -8,7 +8,8 @@ class IndexerTest(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory(dir="/private/tmp")
         cls.base = pathlib.Path(cls.temp.name)
         cls.exe = cls.base / 'Indexer'
-        subprocess.run(['swiftc', '-D', 'TESTING', '-module-cache-path', str(cls.base / 'cache'), str(ROOT / 'Sources/Indexer.swift'), '-o', str(cls.exe)], check=True)
+        (cls.base / 'main.swift').write_text((ROOT / 'Sources/Indexer.swift').read_text())
+        subprocess.run(['swiftc', '-D', 'TESTING', '-module-cache-path', str(cls.base / 'cache'), str(ROOT / 'Sources/SharedSources.swift'), str(cls.base / 'main.swift'), '-o', str(cls.exe)], check=True)
     @classmethod
     def tearDownClass(cls): cls.temp.cleanup()
     def setUp(self):
@@ -40,4 +41,15 @@ class IndexerTest(unittest.TestCase):
         (self.share / 'shared.txt').unlink()
         changed = self.run_index([[str(self.share), 'b' * 64]])
         self.assertNotIn(str(self.share / 'shared.txt'), changed['paths'])
+    def test_disabled_share_keeps_cache_but_skips_scan(self):
+        mounts = [[str(self.share), 'one']]
+        self.run_index(mounts)
+        (self.data / 'shared-selection.json').write_text(json.dumps(['one']))
+        (self.share / 'new.txt').write_text('new')
+        disabled = self.run_index(mounts)
+        self.assertIn(str(self.share / 'shared.txt'), disabled['paths'])
+        self.assertNotIn(str(self.share / 'new.txt'), disabled['paths'])
+        (self.data / 'shared-selection.json').write_text('[]')
+        enabled = self.run_index(mounts)
+        self.assertIn(str(self.share / 'new.txt'), enabled['paths'])
 if __name__ == '__main__': unittest.main()
