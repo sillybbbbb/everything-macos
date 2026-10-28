@@ -379,6 +379,8 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     var activeSearch: SearchCancellation?
     var metadata = [String: [String: Any]]()
     var sourceByPath = [String: String]()
+    var sourceSummaries = [[String: Any]]()
+    var indexIsRunning = false
     let dateFormat: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
@@ -802,15 +804,36 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             }
         }
     }
+    func showSourceSummary() {
+        guard !indexIsRunning, !sourceSummaries.isEmpty else { return }
+        let disabled = SharedSources.readDisabled(in: data)
+        let mounted = Set(SharedSources.mounted().map(\.id))
+        var details = [String]()
+        progress.stringValue = sourceSummaries.compactMap { source -> String? in
+            let id = source["id"] as? String ?? ""
+            guard !disabled.contains(id) else { return nil }
+            let name = source["name"] as? String ?? "本地"
+            let count = NumberFormatter.localizedString(from: NSNumber(value: source["count"] as? Int ?? 0), number: .decimal)
+            let offline = id != "home" && !mounted.contains(id)
+            let warning = source["warning"] as? String
+            let state = offline ? "（未连接）" : (warning == nil ? "" : "（读取异常）")
+            details.append(name + " · 最近刷新：" + (source["updated"] as? String ?? "尚未建立") + (warning.map { " · " + $0 } ?? ""))
+            return "\(name) \(count) 项\(state)"
+        }.joined(separator: " · ")
+        progress.toolTip = details.joined(separator: "\n")
+    }
     func poll() {
+        indexIsRunning = false
         if let raw = try? Data(contentsOf: data.appendingPathComponent("status.json")), let obj = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] {
             var message = obj["message"] as? String ?? ""
             if obj["state"] as? String == "running" {
+                indexIsRunning = true
                 message += " 已收录 \(obj["count"] as? Int ?? 0) 项。"
                 if Date().timeIntervalSince1970 - (obj["updated"] as? Double ?? 0) > 120 { message += " 暂无新进度，可能正在等待网络。" }
             }
             progress.stringValue = message
         }
+        showSourceSummary()
         guard !loading else { return }
         let url = data.appendingPathComponent("index.json")
         let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
@@ -842,6 +865,14 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
                     self.entries = prepared
                     self.metadata = attributes
                     self.sourceByPath = sourceMap
+                    self.sourceSummaries = sources.map { source in
+                        var summary = source
+                        summary["count"] = (source["paths"] as? [String] ?? []).count
+                        summary.removeValue(forKey: "paths")
+                        summary.removeValue(forKey: "metadata")
+                        return summary
+                    }
+                    self.showSourceSummary()
                     let selected = self.selectedScope.isEmpty ? (UserDefaults.standard.string(forKey: "searchScope") ?? "") : self.selectedScope
                     let names = Array(Set(sourceMap.values)).sorted()
                     self.scopeControl.removeAllItems()
